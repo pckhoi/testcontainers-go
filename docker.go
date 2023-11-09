@@ -68,7 +68,7 @@ type DockerContainer struct {
 	terminationSignal chan bool
 	consumers         []LogConsumer
 	raw               *types.ContainerJSON
-	stopProducer      chan bool
+	stopProducer      context.CancelFunc
 	producerDone      chan bool
 	logger            Logging
 	lifecycleHooks    []ContainerLifecycleHooks
@@ -618,10 +618,11 @@ func (c *DockerContainer) StartLogProducer(ctx context.Context) error {
 		return errors.New("log producer already started")
 	}
 
-	c.stopProducer = make(chan bool)
+	var stopCtx context.Context
+	stopCtx, c.stopProducer = context.WithCancel(ctx)
 	c.producerDone = make(chan bool)
 
-	go func(stop <-chan bool, done chan<- bool) {
+	go func(stopCtx context.Context, done chan<- bool) {
 		// signal the producer is done once go routine exits, this prevents race conditions around start/stop
 		defer close(done)
 
@@ -640,19 +641,18 @@ func (c *DockerContainer) StartLogProducer(ctx context.Context) error {
 
 		r, err := c.provider.client.ContainerLogs(ctx, c.GetContainerID(), options)
 		if err != nil {
-			// if we can't get the logs, panic, we can't return an error to anything
-			// from within this goroutine
-			panic(err)
+			c.logger.Printf("error getting container logs: %v", err)
+			return
 		}
 		defer c.provider.Close()
 
 		for {
 			select {
-			case <-stop:
+			case <-stopCtx.Done():
 				err := r.Close()
 				if err != nil {
 					// we can't close the read closer, this should never happen
-					panic(err)
+					c.logger.Printf("error closing reader: %v", err)
 				}
 				return
 			default:
@@ -709,7 +709,7 @@ func (c *DockerContainer) StartLogProducer(ctx context.Context) error {
 				}
 			}
 		}
-	}(c.stopProducer, c.producerDone)
+	}(stopCtx, c.producerDone)
 
 	return nil
 }
@@ -718,7 +718,7 @@ func (c *DockerContainer) StartLogProducer(ctx context.Context) error {
 // and sending them to each added LogConsumer
 func (c *DockerContainer) StopLogProducer() error {
 	if c.stopProducer != nil {
-		c.stopProducer <- true
+		c.stopProducer()
 		// block until the producer is actually done in order to avoid strange races
 		<-c.producerDone
 		c.stopProducer = nil
